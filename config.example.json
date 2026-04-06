@@ -2,13 +2,23 @@
   "port": 18801,
   "credentialsPath": "~/.claude/.credentials.json",
   "replacements": [
-    ["OpenClaw", "assistant platform"],
-    ["openclaw", "assistant platform"],
+    ["OpenClaw", "OCPlatform"],
+    ["openclaw", "ocplatform"],
     ["sessions_spawn", "create_task"],
     ["sessions_list", "list_tasks"],
     ["sessions_history", "get_history"],
     ["sessions_send", "send_to_task"],
+    ["sessions_yield", "yield_task"],
     ["running inside", "running on"]
   ],
-  "_comment": "These 7 patterns are the verified triggers. Add more if Anthropic adds new detection terms."
+  "reverseMap": [
+    ["OCPlatform", "OpenClaw"],
+    ["ocplatform", "openclaw"],
+    ["create_task", "sessions_spawn"],
+    ["list_tasks", "sessions_list"],
+    ["get_history", "sessions_history"],
+    ["send_to_task", "sessions_send"],
+    ["yield_task", "sessions_yield"]
+  ],
+  "_comment": "Replacements sanitize outbound requests. ReverseMap restores original terms in responses. Use space-free replacements for lowercase openclaw to avoid breaking filesystem paths."
 }

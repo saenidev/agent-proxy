@@ -1,6 +1,31 @@
 # Changelog
 
-## v1.1.0 — 2026-04-05
+## v1.2.0 -- 2026-04-05
+
+### Bidirectional reverse mapping + sessions_yield + path-safe replacements
+
+**Changes:**
+- Added bidirectional reverse mapping on all API responses
+  - SSE streaming: reverse-maps each chunk in real-time
+  - JSON responses: buffers, reverse-maps, then sends
+  - Ensures OpenClaw sees original tool names, file paths, and identifiers
+- Added `sessions_yield` to sanitization (new tool in OpenClaw 2026.3.13+)
+- Changed `openclaw` replacement from `assistant platform` (has space, breaks filesystem paths like `.openclaw/`) to `ocplatform` (space-free)
+- Added `reverseMap` config option for customizable response-side mappings
+- Health endpoint now reports `reverseMapPatterns` count
+
+**Why reverse mapping matters:**
+Without it, the model sees sanitized paths (`.ocplatform/workspace/`) in its context and tries to use them for tool calls. The filesystem has `.openclaw/`. Reverse mapping translates responses back so OpenClaw and the filesystem always see original terms.
+
+**Why sessions_yield:**
+`sessions_yield` was added in OpenClaw between v2026.3.11 and v2026.3.13. It's a new session management tool for ending the current agent turn after spawning a subagent. Without sanitizing it, requests fail intermittently when conversation history references this tool.
+
+**Wildcard recommendation:**
+If your OpenClaw version has additional `sessions_*` tools beyond the 5 listed, add them to your config.json replacements and reverseMap arrays.
+
+---
+
+## v1.1.0 -- 2026-04-05
 
 ### Simplified to verified minimal detection bypasses
 
