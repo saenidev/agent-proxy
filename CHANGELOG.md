@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.4.0 -- 2026-04-06
+
+### macOS Keychain support
+
+**Changes:**
+- `setup.js` now auto-detects credentials stored in macOS Keychain when no
+  file-based credentials exist. Checks service names `claude-code`, `claude`,
+  and `com.anthropic.claude-code`. Extracts the token and writes it to
+  `~/.claude/.credentials.json` for the proxy to read.
+- `proxy.js` includes the same Keychain fallback at startup, so it works even
+  if setup wasn't run.
+- `troubleshoot.js` checks Keychain as a diagnostic step and reports findings.
+- `setup.js` also attempts to trigger a credential write by running
+  `claude -p "ping"` if no credentials are found anywhere.
+- Updated README troubleshooting section for Mac Keychain edge cases.
+
+**Why:**
+Some Claude Code versions on macOS store OAuth tokens in the system Keychain
+instead of a file. Users see `claude auth status` showing logged in, but
+`~/.claude/credentials.json` is empty or missing. This affected multiple users
+trying to install the proxy on Mac.
+
+---
+
 ## v1.3.0 -- 2026-04-06
 
 ### HEARTBEAT_OK trigger + missing sessions_* tools + NVM path scanning

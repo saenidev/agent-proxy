@@ -71,15 +71,52 @@ for (const p of credsPaths) {
   }
 }
 
-if (!credsPath) {
-  fail('No credentials file found');
-  info('Searched: ' + credsPaths.join(', '));
+// macOS Keychain fallback
+if (!credsPath && process.platform === 'darwin') {
+  info('No credential files found. Checking macOS Keychain...');
+  const { execSync } = require('child_process');
+  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+  for (const svc of keychainNames) {
+    try {
+      const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+      if (token) {
+        ok('Token found in macOS Keychain', 'service: ' + svc);
+        try {
+          creds = JSON.parse(token);
+        } catch(e) {
+          if (token.startsWith('sk-ant-')) {
+            creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+            info('Raw token extracted (not full JSON structure)');
+          }
+        }
+        if (creds && creds.claudeAiOauth) {
+          credsPath = path.join(homeDir, '.claude', '.credentials.json');
+          info('To make this permanent, run: node setup.js');
+          info('Setup will extract the Keychain token to a file for the proxy');
+        }
+        break;
+      }
+    } catch(e) { /* not found */ }
+  }
+  if (!creds) {
+    fail('Token not found in macOS Keychain either');
+  }
+}
+
+if (!credsPath || !creds) {
+  if (!creds) fail('No credentials found anywhere');
+  info('');
+  info('Searched files: ' + credsPaths.join(', '));
+  if (process.platform === 'darwin') {
+    info('Searched Keychain: claude-code, claude, com.anthropic.claude-code');
+  }
   info('');
   info('To fix:');
   info('  npm install -g @anthropic-ai/claude-code');
   info('  claude auth login');
+  info('  claude -p "test" --max-turns 1 --no-session-persistence   (forces credential write)');
   info('');
-  info('Also try: find ~ -name "*credentials*" -path "*claude*" 2>/dev/null');
+  info('Then run: node setup.js   (auto-extracts Keychain tokens on Mac)');
   console.log('\nCannot continue without credentials. Fix this first.\n');
   process.exit(1);
 }

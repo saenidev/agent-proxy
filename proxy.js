@@ -110,13 +110,47 @@ function loadConfig() {
   let credsPath = null;
   for (const p of credsPaths) {
     const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved)) { credsPath = resolved; break; }
+    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
+      credsPath = resolved;
+      break;
+    }
+  }
+
+  // macOS Keychain fallback: extract token and write to file
+  if (!credsPath && process.platform === 'darwin') {
+    const { execSync } = require('child_process');
+    const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+    for (const svc of keychainNames) {
+      try {
+        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (token) {
+          let creds;
+          try { creds = JSON.parse(token); } catch(e) {
+            if (token.startsWith('sk-ant-')) {
+              creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+            }
+          }
+          if (creds && creds.claudeAiOauth) {
+            credsPath = path.join(homeDir, '.claude', '.credentials.json');
+            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+            fs.writeFileSync(credsPath, JSON.stringify(creds));
+            console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
+            break;
+          }
+        }
+      } catch(e) { /* not found */ }
+    }
   }
 
   if (!credsPath) {
     console.error('[ERROR] Claude Code credentials not found.');
     console.error('Run "claude auth login" first to authenticate.');
+    console.error('On macOS, try: claude -p "test" --max-turns 1 --no-session-persistence');
+    console.error('Then run this proxy again.');
     console.error('Searched:', credsPaths.join(', '));
+    if (process.platform === 'darwin') {
+      console.error('Also checked macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    }
     process.exit(1);
   }
 
