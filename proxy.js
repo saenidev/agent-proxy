@@ -164,7 +164,9 @@ function loadConfig() {
 
 // ─── Token Management ───────────────────────────────────────────────────────
 function getToken(credsPath) {
-  const raw = fs.readFileSync(credsPath, 'utf8');
+  let raw = fs.readFileSync(credsPath, 'utf8');
+  // Strip UTF-8 BOM if present (PowerShell and some editors add this)
+  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
   const creds = JSON.parse(raw);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) {
