@@ -253,7 +253,8 @@ function loadConfig() {
     propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false
+    injectCCStubs: config.injectCCStubs !== false,
+    profiles: config.profiles || null
   };
 }
 
@@ -420,7 +421,8 @@ function reverseMap(text, config) {
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
-function startServer(config) {
+function startServer(config, profileName) {
+  const label = profileName || 'openclaw';
   let requestCount = 0;
   const startedAt = Date.now();
 
@@ -433,6 +435,7 @@ function startServer(config) {
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
           proxy: 'openclaw-billing-proxy',
+          profile: label,
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
@@ -490,21 +493,21 @@ function startServer(config) {
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
-      console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      console.log(`[${ts}] [${label}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
         path: req.url, method: req.method, headers
       }, (upRes) => {
         const status = upRes.statusCode;
-        console.log(`[${ts}] #${reqNum} > ${status}`);
+        console.log(`[${ts}] [${label}] #${reqNum} > ${status}`);
         if (status !== 200 && status !== 201) {
           const errChunks = [];
           upRes.on('data', c => errChunks.push(c));
           upRes.on('end', () => {
             let errBody = Buffer.concat(errChunks).toString();
             if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              console.error(`[${ts}] [${label}] #${reqNum} DETECTION! Body: ${body.length}b`);
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
@@ -532,7 +535,7 @@ function startServer(config) {
         }
       });
       upstream.on('error', e => {
-        console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
+        console.error(`[${ts}] [${label}] #${reqNum} ERR: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
@@ -547,8 +550,10 @@ function startServer(config) {
     try {
       const oauth = getToken(config.credsPath);
       const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
-      console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
-      console.log(`  ─────────────────────────────`);
+      const title = profileName ? `Billing Proxy [${profileName}] v${VERSION}` : `OpenClaw Billing Proxy v${VERSION}`;
+      const sep = '─'.repeat(title.length);
+      console.log(`\n  ${title}`);
+      console.log(`  ${sep}`);
       console.log(`  Port:              ${config.port}`);
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
       console.log(`  Token expires:     ${h}h`);
@@ -559,16 +564,51 @@ function startServer(config) {
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
       console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+      if (!profileName) {
+        console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+      } else {
+        console.log(`\n  Ready. Set ${profileName} baseUrl to http://127.0.0.1:${config.port}\n`);
+      }
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
   });
 
-  process.on('SIGINT', () => process.exit(0));
-  process.on('SIGTERM', () => process.exit(0));
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 const config = loadConfig();
 startServer(config);
+
+// Start additional profile servers (e.g., hermes on a separate port)
+if (config.profiles && typeof config.profiles === 'object') {
+  for (const [name, profile] of Object.entries(config.profiles)) {
+    if (!profile.port) {
+      console.error(`  [${name}] Profile missing "port" — skipped`);
+      continue;
+    }
+    let profileCredsPath = config.credsPath;
+    if (profile.credentialsPath) {
+      const p = profile.credentialsPath.startsWith('~')
+        ? path.join(os.homedir(), profile.credentialsPath.slice(1))
+        : profile.credentialsPath;
+      if (fs.existsSync(p) && fs.statSync(p).size > 0) {
+        profileCredsPath = p;
+      }
+    }
+    startServer({
+      port: profile.port,
+      credsPath: profileCredsPath,
+      replacements: profile.replacements || [],
+      reverseMap: profile.reverseMap || [],
+      toolRenames: profile.toolRenames || [],
+      propRenames: profile.propRenames || [],
+      stripSystemConfig: profile.stripSystemConfig !== undefined ? profile.stripSystemConfig : false,
+      stripToolDescriptions: profile.stripToolDescriptions !== undefined ? profile.stripToolDescriptions : false,
+      injectCCStubs: profile.injectCCStubs !== undefined ? profile.injectCCStubs : false
+    }, name);
+  }
+}
+
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));

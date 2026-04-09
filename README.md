@@ -271,9 +271,91 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 - Run `claude -p "test" --max-turns 1` to force credential write
 - Check Keychain: `security find-generic-password -s "claude" -w 2>/dev/null`
 
+## Multi-Client Profiles
+
+The proxy supports multiple clients simultaneously via the `profiles` config key. Each profile gets its own port and sanitization rules while sharing the same Claude Code credentials and billing logic.
+
+The root-level config is the default profile (OpenClaw). Additional profiles are defined under `profiles`:
+
+```json
+{
+  "port": 18801,
+  "credentialsPath": "~/.claude/.credentials.json",
+  "replacements": [ ... ],
+  "reverseMap": [ ... ],
+  "profiles": {
+    "hermes": {
+      "port": 18802,
+      "replacements": [
+        ["Hermes Agent", "HMXPlatform"],
+        ["hermes-agent", "hmxplatform"],
+        ["Nous Research", "NXR Labs"],
+        ["nousresearch.com", "nxrlabs.example.com"],
+        ["nousresearch", "nxrlabs"]
+      ],
+      "reverseMap": [
+        ["HMXPlatform", "Hermes Agent"],
+        ["hmxplatform", "hermes-agent"],
+        ["NXR Labs", "Nous Research"],
+        ["nxrlabs.example.com", "nousresearch.com"],
+        ["nxrlabs", "nousresearch"]
+      ]
+    }
+  }
+}
+```
+
+When `node proxy.js` starts, it launches the default server on port 18801 (OpenClaw) and a second server on port 18802 (Hermes). Each has its own `/health` endpoint.
+
+Profiles inherit `credentialsPath` from the root config. Override per-profile with `"credentialsPath": "/path/to/creds.json"`.
+
+Profiles can also use v2 layers (`toolRenames`, `propRenames`, `stripSystemConfig`, `stripToolDescriptions`, `injectCCStubs`). By default, profiles have all v2 layers disabled since non-OpenClaw clients may not need them.
+
+### Using with Hermes Agent
+
+1. Start the proxy (it serves both OpenClaw and Hermes):
+
+```bash
+node proxy.js
+```
+
+2. Set a placeholder API key so Hermes credential resolution passes:
+
+```bash
+echo 'ANTHROPIC_API_KEY=proxy-placeholder' >> ~/.hermes/.env
+```
+
+3. Configure Hermes to route through the proxy. Edit `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  provider: "anthropic"
+  base_url: "http://127.0.0.1:18802"
+  default: "claude-sonnet-4-6"
+```
+
+Setting `provider: anthropic` ensures Hermes uses `anthropic_messages` API mode (correct Anthropic request format). The proxy handles billing injection, token swap, and sanitization.
+
+4. Restart Hermes (CLI reads config at startup; the gateway picks up changes per-message).
+
+5. Verify with the health endpoint:
+
+```bash
+curl http://127.0.0.1:18802/health
+```
+
+### Hermes-Specific Notes
+
+- Hermes tool names (`terminal`, `web_search`, `read_file`, etc.) are generic and unlikely to trigger Anthropic's classifier. The default Hermes profile sanitizes platform identifiers only.
+- If you see refusals or billing errors, check the proxy console for 400 status codes and add the triggering terms to the hermes profile's `replacements` and `reverseMap`.
+- Hermes's prompt caching still works -- the billing block is static and injected consistently, so the cache stabilizes after the first request.
+- The `ANTHROPIC_API_KEY` value doesn't matter -- the proxy strips it and uses the Claude Code OAuth token.
+
 ## Rollback
 
-Change `baseUrl` back to `https://api.anthropic.com` in `openclaw.json` and restart the gateway. Enable Extra Usage in your Claude settings if needed.
+**OpenClaw:** Change `baseUrl` back to `https://api.anthropic.com` in `openclaw.json` and restart the gateway.
+
+**Hermes Agent:** Remove `base_url` from `~/.hermes/config.yaml` (or set it to `https://api.anthropic.com`) and remove the placeholder `ANTHROPIC_API_KEY` from `~/.hermes/.env`. Enable Extra Usage in your Claude settings if needed.
 
 ## Disclaimer
 
