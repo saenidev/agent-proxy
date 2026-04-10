@@ -99,6 +99,14 @@ Analyze dumps to find remaining trigger keywords: `python3 -c "import json; body
 - `DEFAULT_PROP_RENAMES`: 8 property name mappings
 - `DEFAULT_REVERSE_MAP`: 33 reverse string patterns
 
+## Git Workflow
+
+Commit and push after every logical change. config.json is gitignored (contains local credential paths). The remote setup:
+- `origin` → `saenidev/agent-proxy` (private fork)
+- `upstream` → `zacdcook/openclaw-billing-proxy` (public source)
+
+Do not include `Co-Authored-By` lines in commits.
+
 ## When Adding New Trigger Keywords
 
 1. Add `[trigger, replacement]` to `DEFAULT_REPLACEMENTS` (respect ordering)
