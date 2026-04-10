@@ -62,6 +62,7 @@ const CC_TOOL_STUBS = [
 // IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
 // breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
+  ['OPENCLAW', 'OCPLATFORM'],
   ['OpenClaw', 'OCPlatform'],
   ['openclaw', 'ocplatform'],
   ['sessions_spawn', 'create_task'],
@@ -73,12 +74,14 @@ const DEFAULT_REPLACEMENTS = [
   ['sessions_store', 'task_store'],
   ['HEARTBEAT_OK', 'HB_ACK'],
   ['HEARTBEAT', 'HB_SIGNAL'],
+  ['Heartbeat', 'Hb_signal'],
   ['heartbeat', 'hb_signal'],
   ['running inside', 'operating from'],
   ['Prometheus', 'PAssistant'],
   ['prometheus', 'passistant'],
   ['clawhub.com', 'skillhub.example.com'],
   ['clawhub', 'skillhub'],
+  ['Clawd', 'Agentd'],
   ['clawd', 'agentd'],
   ['lossless-claw', 'lossless-ctx'],
   ['third-party', 'external'],
@@ -151,6 +154,7 @@ const DEFAULT_PROP_RENAMES = [
 
 // ─── Reverse Mappings ───────────────────────────────────────────────────────
 const DEFAULT_REVERSE_MAP = [
+  ['OCPLATFORM', 'OPENCLAW'],
   ['OCPlatform', 'OpenClaw'],
   ['ocplatform', 'openclaw'],
   ['create_task', 'sessions_spawn'],
@@ -162,11 +166,13 @@ const DEFAULT_REVERSE_MAP = [
   ['task_store', 'sessions_store'],
   ['HB_ACK', 'HEARTBEAT_OK'],
   ['HB_SIGNAL', 'HEARTBEAT'],
+  ['Hb_signal', 'Heartbeat'],
   ['hb_signal', 'heartbeat'],
   ['PAssistant', 'Prometheus'],
   ['passistant', 'prometheus'],
   ['skillhub.example.com', 'clawhub.com'],
   ['skillhub', 'clawhub'],
+  ['Agentd', 'Clawd'],
   ['agentd', 'clawd'],
   ['lossless-ctx', 'lossless-claw'],
   ['external', 'third-party'],
@@ -508,6 +514,8 @@ function startServer(config, profileName) {
             let errBody = Buffer.concat(errChunks).toString();
             if (errBody.includes('extra usage')) {
               console.error(`[${ts}] [${label}] #${reqNum} DETECTION! Body: ${body.length}b`);
+              // Temporary: dump detected request for analysis
+              try { require('fs').writeFileSync('/tmp/proxy_detected_' + label + '_' + reqNum + '.json', body); } catch(e) {}
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
