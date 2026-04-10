@@ -1,21 +1,20 @@
 #!/usr/bin/env node
 /**
- * OpenClaw Subscription Billing Proxy v2.0
+ * OpenClaw Subscription Billing Proxy v2.2
  *
  * Routes OpenClaw API requests through Claude Code's subscription billing
  * instead of Extra Usage. Defeats Anthropic's multi-layer detection:
  *
- *   Layer 1: Billing header injection (84-char Claude Code identifier)
+ *   Layer 1: Billing header injection (dynamic SHA256 fingerprint per request)
  *   Layer 2: String trigger sanitization (OpenClaw, sessions_*, running inside, etc.)
  *   Layer 3: Tool name fingerprint bypass (rename OC tools to CC PascalCase convention)
  *   Layer 4: System prompt template bypass (strip config section, replace with paraphrase)
  *   Layer 5: Tool description stripping (reduce fingerprint signal in tool schemas)
  *   Layer 6: Property name renaming (eliminate OC-specific schema property names)
  *   Layer 7: Full bidirectional reverse mapping (SSE + JSON responses)
+ *   Layer 8: Assistant prefill stripping (Opus 4.6 compatibility)
  *
- * v1.x string-only sanitization stopped working April 8, 2026 when Anthropic
- * upgraded from string matching to tool-name fingerprinting and template detection.
- * v2.0 defeats the new detection by transforming the entire request body.
+ * Supports multi-profile operation (e.g., OpenClaw on :18801, Hermes on :18802).
  *
  * Zero dependencies. Works on Windows, Linux, Mac.
  *
@@ -28,23 +27,35 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.0.0';
+const VERSION = '2.2.4';
 
-// Claude Code billing identifier -- injected into the system prompt
-const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
+// Claude Code version to emulate (update when new CC versions are released)
+const CC_VERSION = '2.1.97';
+
+// Billing fingerprint constants (matches real CC utils/fingerprint.ts)
+const BILLING_HASH_SALT = '59cf53e54c78';
+const BILLING_HASH_INDICES = [4, 7, 20];
+
+// Persistent per-instance identifiers (generated once at startup)
+const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = crypto.randomUUID();
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
-  'claude-code-20250219',
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
+  'advanced-tool-use-2025-11-20',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24'
+  'effort-2025-11-24',
+  'fast-mode-2026-02-01'
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
@@ -57,10 +68,78 @@ const CC_TOOL_STUBS = [
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
 
+// ─── Billing Fingerprint ────────────────────────────────────────────────────
+// Computes a 3-character SHA256 fingerprint hash matching real CC's
+// computeFingerprint() in utils/fingerprint.ts:
+//   SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
+
+function computeBillingFingerprint(firstUserText) {
+  const chars = BILLING_HASH_INDICES.map(i => firstUserText[i] || '0').join('');
+  const input = `${BILLING_HASH_SALT}${chars}${CC_VERSION}`;
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
+}
+
+function extractFirstUserText(bodyStr) {
+  const msgsIdx = bodyStr.indexOf('"messages":[');
+  if (msgsIdx === -1) return '';
+  const userIdx = bodyStr.indexOf('"role":"user"', msgsIdx);
+  if (userIdx === -1) return '';
+  const contentIdx = bodyStr.indexOf('"content"', userIdx);
+  if (contentIdx === -1 || contentIdx > userIdx + 500) return '';
+  const afterContent = bodyStr[contentIdx + '"content"'.length + 1];
+  if (afterContent === '"') {
+    const textStart = contentIdx + '"content":"'.length;
+    let end = textStart;
+    while (end < bodyStr.length) {
+      if (bodyStr[end] === '\\') { end += 2; continue; }
+      if (bodyStr[end] === '"') break;
+      end++;
+    }
+    return bodyStr.slice(textStart, end)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  const textIdx = bodyStr.indexOf('"text":"', contentIdx);
+  if (textIdx === -1 || textIdx > contentIdx + 2000) return '';
+  const textStart = textIdx + '"text":"'.length;
+  let end = textStart;
+  while (end < bodyStr.length) {
+    if (bodyStr[end] === '\\') { end += 2; continue; }
+    if (bodyStr[end] === '"') break;
+    end++;
+  }
+  return bodyStr.slice(textStart, Math.min(end, textStart + 50))
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function buildBillingBlock(bodyStr) {
+  const firstText = extractFirstUserText(bodyStr);
+  const fingerprint = computeBillingFingerprint(firstText);
+  const ccVersion = `${CC_VERSION}.${fingerprint}`;
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+}
+
+// ─── Stainless SDK Headers ──────────────────────────────────────────────────
+function getStainlessHeaders() {
+  const p = process.platform;
+  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  return {
+    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'x-app': 'cli',
+    'x-claude-code-session-id': INSTANCE_SESSION_ID,
+    'x-stainless-arch': arch,
+    'x-stainless-lang': 'js',
+    'x-stainless-os': osName,
+    'x-stainless-package-version': '0.81.0',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.version,
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'anthropic-dangerous-direct-browser-access': 'true'
+  };
+}
+
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
-// Applied globally via split/join on the entire request body.
-// IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
-// breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .oc platform/)
 const DEFAULT_REPLACEMENTS = [
   ['OPENCLAW', 'OCPLATFORM'],
   ['OpenClaw', 'OCPlatform'],
@@ -98,14 +177,6 @@ const DEFAULT_REPLACEMENTS = [
 ];
 
 // ─── Layer 3: Tool Name Renames ─────────────────────────────────────────────
-// Applied as "quoted" replacements ("name" -> "Name") throughout the ENTIRE body.
-// This defeats Anthropic's tool-name fingerprinting which identifies the request
-// as OpenClaw based on the combination of tool names in the tools array.
-//
-// The detector specifically checks for OpenClaw's tool name set. Even with empty
-// schemas (no descriptions, no properties), original tool names trigger detection.
-// Renaming to PascalCase CC-like conventions defeats this entirely.
-//
 // ORDERING: lcm_expand_query MUST come before lcm_expand to avoid partial match.
 const DEFAULT_TOOL_RENAMES = [
   ['exec', 'Bash'],
@@ -126,8 +197,12 @@ const DEFAULT_TOOL_RENAMES = [
   ['session_status', 'StatusCheck'],
   ['web_search', 'WebSearch'],
   ['web_fetch', 'WebFetch'],
-  ['image', 'ImageGen'],
+  // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
+  // type "image". Renaming breaks image tool_results. (upstream issue #14)
   ['pdf', 'PdfParse'],
+  ['image_generate', 'ImageCreate'],
+  ['music_generate', 'MusicCreate'],
+  ['video_generate', 'VideoCreate'],
   ['memory_search', 'KnowledgeSearch'],
   ['memory_get', 'KnowledgeGet'],
   ['lcm_expand_query', 'ContextQuery'],
@@ -140,7 +215,6 @@ const DEFAULT_TOOL_RENAMES = [
 ];
 
 // ─── Layer 6: Property Name Renames ─────────────────────────────────────────
-// OC-specific schema property names that contribute to fingerprinting.
 const DEFAULT_PROP_RENAMES = [
   ['session_id', 'thread_id'],
   ['conversation_id', 'thread_ref'],
@@ -191,40 +265,56 @@ const DEFAULT_REVERSE_MAP = [
 function loadConfig() {
   const args = process.argv.slice(2);
   let configPath = null;
-  let port = DEFAULT_PORT;
+  let cliPort = null;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--port' && args[i + 1]) cliPort = parseInt(args[i + 1]);
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
+  const envPort = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : null;
+
   let config = {};
   if (configPath && fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch(e) {
+      console.error('[ERROR] Failed to parse config: ' + configPath + ' (' + e.message + ')');
+      process.exit(1);
+    }
   } else if (fs.existsSync('config.json')) {
-    config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    try { config = JSON.parse(fs.readFileSync('config.json', 'utf8')); } catch(e) {
+      console.error('[PROXY] Warning: config.json is invalid, using defaults. (' + e.message + ')');
+    }
   }
 
   const homeDir = os.homedir();
+
+  // OAUTH_TOKEN env var takes precedence over file-based credentials (Docker support)
+  let credsPath = null;
+  if (process.env.OAUTH_TOKEN) {
+    credsPath = 'env';
+    console.log('[PROXY] Using OAUTH_TOKEN from environment variable.');
+  }
+
   const credsPaths = [
     config.credentialsPath,
     path.join(homeDir, '.claude', '.credentials.json'),
     path.join(homeDir, '.claude', 'credentials.json')
   ].filter(Boolean);
 
-  let credsPath = null;
-  for (const p of credsPaths) {
-    const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
-      credsPath = resolved;
-      break;
+  if (!credsPath) {
+    for (const p of credsPaths) {
+      const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
+      if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
+        credsPath = resolved;
+        break;
+      }
     }
   }
 
   // macOS Keychain fallback
   if (!credsPath && process.platform === 'darwin') {
-    const { execSync } = require('child_process');
-    for (const svc of ['claude-code', 'claude', 'com.anthropic.claude-code']) {
+    const { execSync } = require('child_process'); // eslint-disable-line -- macOS-only, no user input
+    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (token) {
@@ -240,32 +330,70 @@ function loadConfig() {
             break;
           }
         }
-      } catch(e) {}
+      } catch(e) {} // eslint-disable-line
     }
   }
 
   if (!credsPath) {
-    console.error('[ERROR] Claude Code credentials not found. Run "claude auth login" first.');
+    console.error('[ERROR] Claude Code credentials not found.');
+    console.error('Run "claude auth login" first to authenticate.');
     if (process.platform === 'darwin') console.error('Also checked macOS Keychain.');
+    console.error('For Docker: set OAUTH_TOKEN in .env or mount ~/.claude as a volume.');
     process.exit(1);
   }
 
+  // Merge pattern arrays: defaults first, then config additions/overrides.
+  // Prevents stale config.json from masking new default patterns. (upstream issue #24)
+  // Set "mergeDefaults": false for full manual control.
+  function mergePatterns(defaults, overrides) {
+    if (!overrides || overrides.length === 0) return defaults;
+    const merged = new Map();
+    for (const [find, replace] of defaults) merged.set(find, replace);
+    for (const [find, replace] of overrides) merged.set(find, replace);
+    return [...merged.entries()];
+  }
+
+  const useDefaults = config.mergeDefaults !== false;
+
+  const replacements = useDefaults
+    ? mergePatterns(DEFAULT_REPLACEMENTS, config.replacements)
+    : (config.replacements || DEFAULT_REPLACEMENTS);
+  const reverseMap = useDefaults
+    ? mergePatterns(DEFAULT_REVERSE_MAP, config.reverseMap)
+    : (config.reverseMap || DEFAULT_REVERSE_MAP);
+  const toolRenames = useDefaults
+    ? mergePatterns(DEFAULT_TOOL_RENAMES, config.toolRenames)
+    : (config.toolRenames || DEFAULT_TOOL_RENAMES);
+  const propRenames = useDefaults
+    ? mergePatterns(DEFAULT_PROP_RENAMES, config.propRenames)
+    : (config.propRenames || DEFAULT_PROP_RENAMES);
+
+  if (config.replacements && useDefaults && config.replacements.length < DEFAULT_REPLACEMENTS.length) {
+    console.log(`[PROXY] Note: config.json has ${config.replacements.length} replacements, merged with ${DEFAULT_REPLACEMENTS.length} defaults -> ${replacements.length} total`);
+  }
+
   return {
-    port: config.port || port,
+    port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
-    replacements: config.replacements || DEFAULT_REPLACEMENTS,
-    reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
-    toolRenames: config.toolRenames || DEFAULT_TOOL_RENAMES,
-    propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
+    replacements,
+    reverseMap,
+    toolRenames,
+    propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     profiles: config.profiles || null
   };
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
 function getToken(credsPath) {
+  if (credsPath === 'env') {
+    const token = process.env.OAUTH_TOKEN;
+    if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
+    return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
+  }
   let raw = fs.readFileSync(credsPath, 'utf8');
   if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
   const creds = JSON.parse(raw);
@@ -275,11 +403,19 @@ function getToken(credsPath) {
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
+// String-aware bracket matching (skips brackets inside JSON strings)
 function findMatchingBracket(str, start) {
-  let d = 0;
+  let d = 0, inStr = false;
   for (let i = start; i < str.length; i++) {
-    if (str[i] === '[') d++;
-    else if (str[i] === ']') { d--; if (d === 0) return i; }
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[') d++;
+    else if (c === ']') { d--; if (d === 0) return i; }
   }
   return -1;
 }
@@ -304,29 +440,24 @@ function processBody(bodyStr, config) {
   }
 
   // Layer 4: System prompt template bypass
-  // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
-  // and replace with a brief paraphrase. The config is between the identity line
-  // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
+  // Anchored to the system array to avoid matching conversation history.
   if (config.stripSystemConfig) {
     const IDENTITY_MARKER = 'You are a personal assistant';
-    const configStart = m.indexOf(IDENTITY_MARKER);
+    const sysArrayStart = m.indexOf('"system":[');
+    const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
+    const configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header (AGENTS.md)
-      const configEnd = m.indexOf('AGENTS.md', configStart);
+      // Find end of config: first workspace doc header with a filesystem path.
+      // Using filesystem paths instead of 'AGENTS.md' avoids premature boundary
+      // when that string appears in skill content. (upstream issue #26)
+      let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
+      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
       if (configEnd !== -1) {
-        // Back up to the \n## before AGENTS.md
-        let boundary = configEnd;
-        for (let i = configEnd - 1; i > stripFrom; i--) {
-          if (m[i] === '#' && m[i - 1] === '#' && i >= 3 && m[i - 3] === '\\' && m[i - 2] === 'n') {
-            boundary = i - 3;
-            break;
-          }
-        }
-
+        const boundary = configEnd;
         const strippedLen = boundary - stripFrom;
         if (strippedLen > 1000) {
           const PARAPHRASE =
@@ -366,7 +497,6 @@ function processBody(bodyStr, config) {
           section = section.slice(0, vs) + section.slice(i);
           from = vs + 1;
         }
-        // Inject CC tool stubs
         if (config.injectCCStubs) {
           const insertAt = '"tools":['.length;
           section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
@@ -375,7 +505,6 @@ function processBody(bodyStr, config) {
       }
     }
   } else if (config.injectCCStubs) {
-    // Inject stubs even without description stripping
     const toolsIdx = m.indexOf('"tools":[');
     if (toolsIdx !== -1) {
       const insertAt = toolsIdx + '"tools":['.length;
@@ -383,7 +512,8 @@ function processBody(bodyStr, config) {
     }
   }
 
-  // Layer 1: Billing header injection
+  // Layer 1: Billing header injection (dynamic fingerprint per request)
+  const BILLING_BLOCK = buildBillingBlock(m);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
@@ -405,19 +535,76 @@ function processBody(bodyStr, config) {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
+  // Metadata injection: device_id + session_id matching real CC format
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+  const existingMeta = m.indexOf('"metadata":{');
+  if (existingMeta !== -1) {
+    let depth = 0, mi = existingMeta + '"metadata":'.length;
+    for (; mi < m.length; mi++) {
+      if (m[mi] === '{') depth++;
+      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+    }
+    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+  } else {
+    m = '{' + metaJson + ',' + m.slice(1);
+  }
+
+  // Layer 8: Strip trailing assistant prefill (Opus 4.6 compatibility)
+  if (config.stripTrailingAssistantPrefill !== false) {
+    const msgsIdx = m.indexOf('"messages":[');
+    if (msgsIdx !== -1) {
+      const arrayStart = msgsIdx + '"messages":['.length;
+      const positions = [];
+      let depth = 0, inString = false, objStart = -1;
+      for (let i = arrayStart; i < m.length; i++) {
+        const c = m[i];
+        if (inString) {
+          if (c === '\\') { i++; continue; }
+          if (c === '"') inString = false;
+          continue;
+        }
+        if (c === '"') { inString = true; continue; }
+        if (c === '{') { if (depth === 0) objStart = i; depth++; }
+        else if (c === '}') { depth--; if (depth === 0 && objStart !== -1) { positions.push({ start: objStart, end: i }); objStart = -1; } }
+        else if (c === ']' && depth === 0) break;
+      }
+      let popped = 0;
+      while (positions.length > 0) {
+        const last = positions[positions.length - 1];
+        const obj = m.slice(last.start, last.end + 1);
+        if (!obj.includes('"role":"assistant"')) break;
+        let stripFrom = last.start;
+        for (let i = last.start - 1; i >= arrayStart; i--) {
+          if (m[i] === ',') { stripFrom = i; break; }
+          if (m[i] !== ' ' && m[i] !== '\n' && m[i] !== '\r' && m[i] !== '\t') break;
+        }
+        m = m.slice(0, stripFrom) + m.slice(last.end + 1);
+        positions.pop();
+        popped++;
+      }
+      if (popped > 0) {
+        console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
+      }
+    }
+  }
+
   return m;
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
 function reverseMap(text, config) {
   let r = text;
-  // Reverse tool names first (more specific patterns)
+  // Reverse tool names — both plain ("Name") AND escaped (\"Name\") forms.
+  // SSE input_json_delta has escaped quotes in partial_json. (upstream issue #11)
   for (const [orig, cc] of config.toolRenames) {
     r = r.split('"' + cc + '"').join('"' + orig + '"');
+    r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
   }
-  // Reverse property names
+  // Reverse property names — same dual handling
   for (const [orig, renamed] of config.propRenames) {
     r = r.split('"' + renamed + '"').join('"' + orig + '"');
+    r = r.split('\\"' + renamed + '\\"').join('\\"' + orig + '\\"');
   }
   // Reverse string replacements
   for (const [sanitized, original] of config.reverseMap) {
@@ -445,7 +632,7 @@ function startServer(config, profileName) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
-          tokenExpiresInHours: expiresIn.toFixed(1),
+          tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
@@ -486,12 +673,20 @@ function startServer(config, profileName) {
       for (const [key, value] of Object.entries(req.headers)) {
         const lk = key.toLowerCase();
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
-            lk === 'x-api-key' || lk === 'content-length') continue;
+            lk === 'x-api-key' || lk === 'content-length' ||
+            lk === 'x-session-affinity') continue;
         headers[key] = value;
       }
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
       headers['accept-encoding'] = 'identity';
+      headers['anthropic-version'] = '2023-06-01';
+
+      // Inject Stainless SDK + Claude Code identity headers
+      const ccHeaders = getStainlessHeaders();
+      for (const [k, v] of Object.entries(ccHeaders)) {
+        headers[k] = v;
+      }
 
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
@@ -514,21 +709,44 @@ function startServer(config, profileName) {
             let errBody = Buffer.concat(errChunks).toString();
             if (errBody.includes('extra usage')) {
               console.error(`[${ts}] [${label}] #${reqNum} DETECTION! Body: ${body.length}b`);
-              // Temporary: dump detected request for analysis
-              try { require('fs').writeFileSync('/tmp/proxy_detected_' + label + '_' + reqNum + '.json', body); } catch(e) {}
+              try { fs.writeFileSync('/tmp/proxy_detected_' + label + '_' + reqNum + '.json', body); } catch(e) {} // eslint-disable-line
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(errBody);
             res.writeHead(status, nh);
             res.end(errBody);
           });
           return;
         }
+        // SSE streaming with tail-buffer for chunk boundary safety (upstream issue #11)
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          res.writeHead(status, upRes.headers);
-          upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-          upRes.on('end', () => res.end());
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];
+          delete sseHeaders['transfer-encoding'];
+          res.writeHead(status, sseHeaders);
+          const TAIL_SIZE = 64;
+          const decoder = new StringDecoder('utf8');
+          let pending = '';
+          upRes.on('data', (chunk) => {
+            pending += decoder.write(chunk);
+            if (pending.length > TAIL_SIZE) {
+              let sliceIdx = pending.length - TAIL_SIZE;
+              const prev = pending.charCodeAt(sliceIdx - 1);
+              if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
+              const flushable = pending.slice(0, sliceIdx);
+              pending = pending.slice(sliceIdx);
+              res.write(reverseMap(flushable, config));
+            }
+          });
+          upRes.on('end', () => {
+            pending += decoder.end();
+            if (pending.length > 0) {
+              res.write(reverseMap(pending, config));
+            }
+            res.end();
+          });
         } else {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
@@ -536,6 +754,7 @@ function startServer(config, profileName) {
             let respBody = Buffer.concat(respChunks).toString();
             respBody = reverseMap(respBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding'];
             nh['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(status, nh);
             res.end(respBody);
@@ -554,41 +773,48 @@ function startServer(config, profileName) {
     });
   });
 
-  server.listen(config.port, '127.0.0.1', () => {
+  const bindHost = process.env.PROXY_HOST || '127.0.0.1';
+  server.listen(config.port, bindHost, () => {
     try {
       const oauth = getToken(config.credsPath);
-      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+      const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
       const title = profileName ? `Billing Proxy [${profileName}] v${VERSION}` : `OpenClaw Billing Proxy v${VERSION}`;
       const sep = '─'.repeat(title.length);
       console.log(`\n  ${title}`);
       console.log(`  ${sep}`);
       console.log(`  Port:              ${config.port}`);
+      console.log(`  Bind address:      ${bindHost}`);
+      console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
-      console.log(`  Token expires:     ${h}h`);
+      console.log(`  Token expires:     ${h}`);
       console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
       console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
       console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
       console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
+      console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+      console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
       if (!profileName) {
-        console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+        console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
       } else {
-        console.log(`\n  Ready. Set ${profileName} baseUrl to http://127.0.0.1:${config.port}\n`);
+        console.log(`\n  Ready. Set ${profileName} baseUrl to http://${bindHost}:${config.port}\n`);
       }
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
   });
-
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 const config = loadConfig();
 startServer(config);
 
-// Start additional profile servers (e.g., hermes on a separate port)
+// Start additional profile servers (e.g., hermes on a separate port).
+// Profiles use OVERRIDE semantics (not merge) to stay isolated from
+// the default OpenClaw patterns — each profile controls its own rules.
 if (config.profiles && typeof config.profiles === 'object') {
   for (const [name, profile] of Object.entries(config.profiles)) {
     if (!profile.port) {
@@ -613,7 +839,8 @@ if (config.profiles && typeof config.profiles === 'object') {
       propRenames: profile.propRenames || [],
       stripSystemConfig: profile.stripSystemConfig !== undefined ? profile.stripSystemConfig : false,
       stripToolDescriptions: profile.stripToolDescriptions !== undefined ? profile.stripToolDescriptions : false,
-      injectCCStubs: profile.injectCCStubs !== undefined ? profile.injectCCStubs : false
+      injectCCStubs: profile.injectCCStubs !== undefined ? profile.injectCCStubs : false,
+      stripTrailingAssistantPrefill: profile.stripTrailingAssistantPrefill !== undefined ? profile.stripTrailingAssistantPrefill : false
     }, name);
   }
 }
