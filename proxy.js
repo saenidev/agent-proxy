@@ -36,7 +36,10 @@ const UPSTREAM_HOST = 'api.anthropic.com';
 const VERSION = '2.2.4';
 
 // Claude Code version to emulate (update when new CC versions are released)
-const CC_VERSION = '2.1.97';
+// Bumped to 2.1.112 (2026-04-16 build) to enable subscription billing for
+// claude-opus-4-7. Older versions get routed to Extra Usage for 4.7 requests.
+// Verified salt/indices unchanged from 2.1.97 by inspecting the CC 2.1.112 binary.
+const CC_VERSION = '2.1.112';
 
 // Billing fingerprint constants (matches real CC utils/fingerprint.ts)
 const BILLING_HASH_SALT = '59cf53e54c78';
