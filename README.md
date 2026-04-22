@@ -10,7 +10,7 @@ After Anthropic revoked subscription billing for third-party tools (April 4, 202
 
 ## How It Works
 
-The proxy performs 7-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
+The proxy performs 8-layer bidirectional request/response processing to defeat Anthropic's multi-layer detection:
 
 **Outbound (request to API):**
 1. **Billing Header** -- Injects an 84-character Claude Code billing identifier into the system prompt
@@ -309,7 +309,7 @@ When `node proxy.js` starts, it launches the default server on port 18801 (OpenC
 
 Profiles inherit `credentialsPath` from the root config. Override per-profile with `"credentialsPath": "/path/to/creds.json"`.
 
-Profiles can also use v2 layers (`toolRenames`, `propRenames`, `stripSystemConfig`, `stripToolDescriptions`, `injectCCStubs`). By default, profiles have all v2 layers disabled since non-OpenClaw clients may not need them.
+Profiles can also use v2 layers (`toolRenames`, `propRenames`, `stripSystemConfig`, `stripToolDescriptions`, `injectCCStubs`, `stripTrailingAssistantPrefill`). By default, profiles have all v2 layers disabled since non-OpenClaw clients may not need them — but most non-trivial clients do. A client with distinctive tool-name prefixes (e.g. Hermes' `mcp_*`) WILL trigger Anthropic's tool-name fingerprint classifier and needs `toolRenames` plus at minimum `stripToolDescriptions: true` and `injectCCStubs: true`.
 
 ### Using with Hermes Agent
 
@@ -331,7 +331,7 @@ echo 'ANTHROPIC_API_KEY=proxy-placeholder' >> ~/.hermes/.env
 model:
   provider: "anthropic"
   base_url: "http://127.0.0.1:18802"
-  default: "claude-sonnet-4-6"
+  default: "claude-opus-4-7"
 ```
 
 Setting `provider: anthropic` ensures Hermes uses `anthropic_messages` API mode (correct Anthropic request format). The proxy handles billing injection, token swap, and sanitization.
@@ -346,10 +346,12 @@ curl http://127.0.0.1:18802/health
 
 ### Hermes-Specific Notes
 
-- Hermes tool names (`terminal`, `web_search`, `read_file`, etc.) are generic and unlikely to trigger Anthropic's classifier. The default Hermes profile sanitizes platform identifiers only.
-- If you see refusals or billing errors, check the proxy console for 400 status codes and add the triggering terms to the hermes profile's `replacements` and `reverseMap`.
-- Hermes's prompt caching still works -- the billing block is static and injected consistently, so the cache stabilizes after the first request.
-- The `ANTHROPIC_API_KEY` value doesn't matter -- the proxy strips it and uses the Claude Code OAuth token.
+- **MCP tool names trigger detection.** Hermes ships its tools with an `mcp_` prefix (`mcp_terminal`, `mcp_browser_click`, `mcp_read_file`, ...). Anthropic's classifier uses the tool-name *set* as a fingerprint; a request containing 40+ `mcp_*` names bills to Extra Usage even when every other layer is clean. The Hermes profile therefore needs `toolRenames` covering every tool Hermes exposes — map them to PascalCase (`mcp_terminal` → `Terminal`, `mcp_browser_click` → `BrowserClick`, etc.). See `config.example.json` or the current `config.json` for a full 47-entry example.
+- **Opus 4.7 requires an up-to-date `CC_VERSION`.** The proxy emulates CC 2.1.112. If you upgrade Claude Code past that, bump `CC_VERSION` in `proxy.js` to match. Older emulated versions (e.g. 2.1.97) get routed to Extra Usage on 4.7 requests.
+- **Fast-mode is Opus 4.6-only.** The proxy automatically withholds `fast-mode-2026-02-01` from non-4.6 requests. No action needed unless you add new model-exclusive betas.
+- The Hermes profile runs with `stripToolDescriptions`, `injectCCStubs`, and `stripTrailingAssistantPrefill` enabled. `stripSystemConfig` stays off — its marker only matches OpenClaw's prompt format.
+- Hermes's prompt caching still works — the billing block is static and injected consistently, so the cache stabilizes after the first request.
+- The `ANTHROPIC_API_KEY` value doesn't matter — the proxy strips it and uses the Claude Code OAuth token.
 
 ## Rollback
 

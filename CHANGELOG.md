@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.2.5 -- 2026-04-22
+
+### Claude Opus 4.7 support
+
+Opus 4.7 requests started returning `400 "You're out of extra usage"` even with a valid Max subscription and a clean proxy request. Three independent fixes required:
+
+**1. Emulated CC version bump: 2.1.97 → 2.1.112**
+
+Anthropic gates subscription billing by Claude Code version. CC 2.1.97 predates Opus 4.7's release, so the backend refuses subscription billing and falls through to Extra Usage. The fingerprint salt (`59cf53e54c78`) and hash indices `[4,7,20]` are unchanged across the version range — verified by `strings`-ing the real CC 2.1.112 binary — so the only change needed is the version constant.
+
+**2. `fast-mode-2026-02-01` gated to Opus 4.6**
+
+Real CC 2.1.112 only includes the fast-mode beta conditionally, via a model-eligibility check (`hj(model)` in the binary). Sending it alongside any other model (4.7, Sonnet, Haiku) causes Anthropic to reject subscription billing. The proxy now exposes a `MODEL_GATED_BETAS` table:
+
+```js
+const MODEL_GATED_BETAS = [
+  { beta: 'fast-mode-2026-02-01', test: m => /opus-4-6/.test(m) }
+];
+```
+
+The request's `model` is extracted from the body and each gated beta is included only if its predicate matches.
+
+**3. Per-profile `toolRenames` now required for clients with distinctive tool-name prefixes**
+
+Anthropic's tool-name fingerprint classifier (introduced April 8) scans the tool-name *set*. Hermes ships 47 tools all prefixed `mcp_*` — that combination is enough to classify the request as non-CC and reject subscription billing, even with every other layer clean. Bisection proved this: stripping the `mcp_` prefix from tool names (snake_case OR PascalCase) passes; leaving just 10 `mcp_*` tools fails. The Hermes profile now ships 47 explicit renames (`mcp_browser_click` → `BrowserClick`, etc.). Profiles for any client with a distinctive prefix should do the same.
+
+**Other profile hardening:** Hermes profile now runs with `stripToolDescriptions: true`, `injectCCStubs: true`, `stripTrailingAssistantPrefill: true`.
+
+**Debugging methodology (documented in CLAUDE.md):** When "out of extra usage" only affects some models:
+1. Minimal-request sanity check via curl — isolates billing-path vs content issues
+2. Bump `CC_VERSION` to match the current installed `claude --version`
+3. Verify `MODEL_GATED_BETAS` excludes model-exclusive betas from incompatible models
+4. Bisect the failing request (drop thinking, tools, system parts) to find the trigger
+
+---
+
 ## v2.0.0 -- 2026-04-08
 
 ### Defeat Anthropic's upgraded detection (tool-name fingerprinting + template matching)

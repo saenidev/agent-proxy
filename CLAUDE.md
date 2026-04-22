@@ -32,7 +32,7 @@ Client (:18801/:18802)
     Layer 4: System prompt template strip (~28K → ~0.5K paraphrase)
     Layer 5: Tool description strip + CC stub injection (5 fake tools)
     Layer 1: Billing header injection (84-char CC identifier into system array)
-  → HTTPS to api.anthropic.com (OAuth token + 6 beta flags)
+  → HTTPS to api.anthropic.com (OAuth token + 7 required betas, fast-mode gated to opus-4-6)
   → reverseMap(): tool names → property names → string replacements
   → Response back to client
 ```
@@ -41,7 +41,15 @@ Client (:18801/:18802)
 
 Root config = default OpenClaw profile (port 18801, all 7 layers enabled). Additional profiles under `"profiles"` key get their own port and rules, sharing credentials. Each profile has independent `/health`.
 
-Profiles default to all v2 layers **disabled** — enable explicitly if needed.
+Profiles default to v2 layers (toolRenames, propRenames, stripSystemConfig, stripToolDescriptions, injectCCStubs, stripTrailingAssistantPrefill) **disabled** — enable per-profile as needed. The Hermes profile currently runs with `stripToolDescriptions`, `injectCCStubs`, `stripTrailingAssistantPrefill` on, plus 47 `mcp_*`→PascalCase tool renames. `stripSystemConfig` stays off because its `IDENTITY_MARKER` only matches OpenClaw's prompt format.
+
+### Emulated Claude Code Version
+
+`CC_VERSION` (proxy.js:39) must stay reasonably close to a real CC release — Anthropic gates model-family access by CC version. Opus 4.7 subscription billing requires ≥ 2.1.112 (CC 2.1.97 gets routed to Extra Usage). Bump when Anthropic releases new models. Salt (`59cf53e54c78`) and indices `[4,7,20]` haven't changed across 2.1.97→2.1.112; verify by inspecting the CC binary (`strings $(readlink -f $(which claude)) | grep 59cf53e54c78`) before assuming.
+
+### Model-Gated Betas
+
+`fast-mode-2026-02-01` is Opus 4.6-exclusive. Sending it with any other model (4.7, Sonnet, Haiku) makes Anthropic reject subscription billing. The proxy gates this via the `MODEL_GATED_BETAS` table (proxy.js) that runs after `REQUIRED_BETAS` are added. To gate a new beta, add `{ beta, test: m => /regex/.test(m) }` to the table.
 
 ## Critical Configuration Gotcha
 
@@ -91,8 +99,10 @@ Analyze dumps to find remaining trigger keywords: `python3 -c "import json; body
 
 ## Key Constants (proxy.js header)
 
-- `BILLING_BLOCK`: 84-char CC billing identifier injected into system prompt
-- `REQUIRED_BETAS`: 6 beta flags required for OAuth + CC features
+- `CC_VERSION`: Emulated Claude Code version; controls billing fingerprint + which models Anthropic will bill to subscription
+- `BILLING_HASH_SALT` / `BILLING_HASH_INDICES`: Fingerprint inputs — must match the real CC binary for the emulated version
+- `REQUIRED_BETAS`: 7 always-on beta flags (OAuth, CC core, tool use, thinking, caching, effort, context management)
+- `MODEL_GATED_BETAS`: Betas sent only when the request's `model` matches a predicate (currently: fast-mode → opus-4-6 only)
 - `CC_TOOL_STUBS`: 5 minimal tool schemas (Glob, Grep, Agent, NotebookEdit, TodoRead)
 - `DEFAULT_REPLACEMENTS`: 33 string sanitization patterns
 - `DEFAULT_TOOL_RENAMES`: 29 tool name → PascalCase CC mappings
@@ -111,7 +121,17 @@ Do not include `Co-Authored-By` lines in commits.
 
 1. Add `[trigger, replacement]` to `DEFAULT_REPLACEMENTS` (respect ordering)
 2. Add `[replacement, trigger]` to `DEFAULT_REVERSE_MAP`
-3. If it's a tool name, add to `DEFAULT_TOOL_RENAMES` instead (quoted matching)
+3. If it's a tool name, add to `DEFAULT_TOOL_RENAMES` instead (quoted matching, auto-reversed by `reverseMap()`)
 4. If it's a schema property, add to `DEFAULT_PROP_RENAMES` instead
-5. For profile-specific triggers, add to the profile's `replacements`/`reverseMap` in `config.json`
+5. For profile-specific triggers, add to the profile's `replacements` / `toolRenames` / `propRenames` / `reverseMap` in `config.json`
 6. Test: restart proxy, send request, check for `DETECTION!` in logs
+
+## When Debugging "Out of Extra Usage" on a Specific Model
+
+If requests pass for some models but fail for others (e.g. Opus 4.6 works, Opus 4.7 fails), the issue is likely **not** a sanitization miss. Check in this order:
+
+1. **Minimal-request sanity check** — `curl` the proxy with `{"model":"<model>","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`. If this fails, it's a billing-path issue (version, gated beta, subscription tier). If it passes, the request's *content* is the problem.
+2. **Version gating** — bump `CC_VERSION` to the current installed CC (`claude --version`). Older CC versions aren't authorized for newer model families.
+3. **Model-gated betas** — verify `MODEL_GATED_BETAS` correctly excludes model-exclusive betas (fast-mode, etc.) from incompatible models.
+4. **Tool-name fingerprinting** — if minimal passes but real requests fail, bisect the request (strip thinking, tools, output_config, system) against the proxy to isolate the trigger. If tools are the cause, add `toolRenames` so every tool name looks like CC PascalCase.
+5. **Tool-set bisection** — keep the request minimal but include the tools; progressively shrink the tool list. A characteristic prefix set (e.g. `mcp_*`) is almost always the fingerprint.
