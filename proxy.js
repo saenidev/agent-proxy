@@ -57,9 +57,20 @@ const REQUIRED_BETAS = [
   'advanced-tool-use-2025-11-20',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24',
-  'fast-mode-2026-02-01'
+  'effort-2025-11-24'
 ];
+
+// Model-gated betas: only send when the target model actually supports them.
+// fast-mode is Opus 4.6-exclusive; including it on Opus 4.7 causes Anthropic
+// to reject subscription billing and fall through to Extra Usage.
+const MODEL_GATED_BETAS = [
+  { beta: 'fast-mode-2026-02-01', test: m => /opus-4-6/.test(m) }
+];
+
+function extractModel(bodyStr) {
+  const m = bodyStr.match(/"model"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : '';
+}
 
 // CC tool stubs -- injected into tools array to make the tool set look more
 // like a Claude Code session. The model won't call these (schemas are minimal).
@@ -694,6 +705,11 @@ function startServer(config, profileName) {
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
       for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
+      const model = extractModel(bodyStr);
+      for (const { beta, test } of MODEL_GATED_BETAS) {
+        if (test(model)) { if (!betas.includes(beta)) betas.push(beta); }
+        else { const i = betas.indexOf(beta); if (i !== -1) betas.splice(i, 1); }
+      }
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
