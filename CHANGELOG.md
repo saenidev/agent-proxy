@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.3.0 -- 2026-04-24
+
+### Automatic OAuth token refresh
+
+Claude Code OAuth access tokens expire every ~24 hours. Previously the proxy had no refresh path: when the on-disk token expired, every upstream request started returning `401 invalid x-api-key` until the user manually ran the CC CLI (or restarted some other process) to trigger a refresh. Client agents that classify 401 as non-retryable (which is the correct classification) would wedge mid-conversation, and new sessions wouldn't help because the stale token persisted on disk.
+
+The credentials file has always contained everything needed for a refresh — `{accessToken, refreshToken, expiresAt, scopes, ...}` — it just wasn't being used. Now it is.
+
+**Changes:**
+
+- **`refreshOauthToken(credsPath)`** — POSTs to `https://console.anthropic.com/v1/oauth/token` with `grant_type=refresh_token` and Claude Code's public client id (`9d1c250a-e61b-44d9-88ed-5944d1962f5e`, extracted from the CC binary). Writes the new access+refresh tokens back to disk atomically (tmp file + rename) so concurrent readers never see a partial file, and preserves existing fields like `subscriptionType`, `rateLimitTier`, and the rotated `refreshToken` if the IdP rotates it.
+- **Proactive refresh** — `getFreshToken()` triggers a refresh when the token is within 5 minutes of expiry, so requests see a fresh token before the current one dies. Falls back to the (possibly stale) token on refresh failure so a transient network blip doesn't instantly brick the proxy.
+- **Reactive refresh on 401** — if upstream returns `401` with an authentication-error-shaped body, the request handler refreshes the token once and retries the same request. Logs `got 401 — refreshing token and retrying…` when this fires.
+- **Concurrent-request coalescing** — `inflightRefresh` map deduplicates refreshes per credentials file, so a burst of parallel requests triggers exactly one upstream refresh call, not N.
+
+Env-var tokens (`OAUTH_TOKEN` / Docker) are unchanged — they have no refresh flow by design, since there's no on-disk `refreshToken` for them.
+
+Zero new dependencies. All done with `https.request` and `fs`.
+
 ## v2.2.5 -- 2026-04-22
 
 ### Claude Opus 4.7 support

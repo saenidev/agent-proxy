@@ -33,7 +33,7 @@ const { StringDecoder } = require('string_decoder');
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.4';
+const VERSION = '2.3.0';
 
 // Claude Code version to emulate (update when new CC versions are released)
 // Bumped to 2.1.112 (2026-04-16 build) to enable subscription billing for
@@ -402,18 +402,147 @@ function loadConfig() {
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
+// Claude Code's public OAuth client id (from the CC binary). Needed for the
+// refresh_token grant below.
+const CC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const CC_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
+
+// Refresh tokens ~5 min before expiry, and treat anything within this window
+// as "refresh eagerly" so concurrent requests don't race a 401.
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+// Per-credsPath in-flight refresh promises so parallel requests coalesce
+// into one upstream refresh call instead of stampeding console.anthropic.com.
+const inflightRefresh = new Map();
+
+function readCreds(credsPath) {
+  let raw = fs.readFileSync(credsPath, 'utf8');
+  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+  return JSON.parse(raw);
+}
+
+function writeCredsAtomic(credsPath, creds) {
+  // Atomic write: tmp file + rename, so CC/other readers never see a truncated
+  // credentials.json. (CC itself rewrites this file on auto-refresh — upstream
+  // CHANGELOG already warns that a partial write can leave a BOM/corrupted
+  // file behind.)
+  const tmp = credsPath + '.tmp-' + process.pid + '-' + Date.now();
+  const data = JSON.stringify(creds, null, 2);
+  try {
+    fs.writeFileSync(tmp, data, { mode: 0o600 });
+    fs.renameSync(tmp, credsPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch(_) {} // eslint-disable-line
+    throw e;
+  }
+}
+
+function httpsPostJson(urlStr, bodyObj) {
+  // Zero-deps POST helper. Returns a Promise<{status, body}>.
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const body = JSON.stringify(bodyObj);
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + (u.search || ''),
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        'accept': 'application/json',
+        'user-agent': 'openclaw-billing-proxy/' + VERSION
+      }
+    }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        body: Buffer.concat(chunks).toString('utf8')
+      }));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function refreshOauthToken(credsPath) {
+  // env-var tokens (Docker / OAUTH_TOKEN) have no refresh flow.
+  if (credsPath === 'env') {
+    throw new Error('OAUTH_TOKEN env var tokens cannot be refreshed.');
+  }
+  // Coalesce concurrent refreshes on the same creds file.
+  if (inflightRefresh.has(credsPath)) return inflightRefresh.get(credsPath);
+
+  const p = (async () => {
+    const creds = readCreds(credsPath);
+    const oauth = creds.claudeAiOauth;
+    if (!oauth || !oauth.refreshToken) {
+      throw new Error('No refresh token on disk. Run "claude auth login" to re-authenticate.');
+    }
+    const { status, body } = await httpsPostJson(CC_OAUTH_TOKEN_URL, {
+      grant_type: 'refresh_token',
+      refresh_token: oauth.refreshToken,
+      client_id: CC_OAUTH_CLIENT_ID
+    });
+    if (status !== 200) {
+      throw new Error('OAuth refresh failed: HTTP ' + status + ' ' + body.slice(0, 400));
+    }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch (e) {
+      throw new Error('OAuth refresh returned non-JSON: ' + body.slice(0, 200));
+    }
+    if (!parsed.access_token) {
+      throw new Error('OAuth refresh response missing access_token: ' + body.slice(0, 200));
+    }
+    const expiresIn = typeof parsed.expires_in === 'number' ? parsed.expires_in : 3600;
+    const updated = {
+      ...oauth,
+      accessToken: parsed.access_token,
+      // Some IdPs rotate refresh tokens, others don't — preserve old one if missing.
+      refreshToken: parsed.refresh_token || oauth.refreshToken,
+      expiresAt: Date.now() + expiresIn * 1000
+    };
+    if (parsed.scope) updated.scopes = parsed.scope.split(' ');
+    creds.claudeAiOauth = updated;
+    writeCredsAtomic(credsPath, creds);
+    const hrs = (expiresIn / 3600).toFixed(1);
+    console.log('[AUTH] Refreshed OAuth token (expires in ' + hrs + 'h).');
+    return updated;
+  })();
+
+  inflightRefresh.set(credsPath, p);
+  try { return await p; }
+  finally { inflightRefresh.delete(credsPath); }
+}
+
 function getToken(credsPath) {
   if (credsPath === 'env') {
     const token = process.env.OAUTH_TOKEN;
     if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
     return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
   }
-  let raw = fs.readFileSync(credsPath, 'utf8');
-  if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
-  const creds = JSON.parse(raw);
+  const creds = readCreds(credsPath);
   const oauth = creds.claudeAiOauth;
   if (!oauth || !oauth.accessToken) throw new Error('No OAuth token. Run "claude auth login".');
   return oauth;
+}
+
+// Like getToken, but proactively refreshes if the token is within the skew
+// window of expiry. Falls back to the stale token on refresh failure so a
+// transient network blip doesn't instantly brick the proxy.
+async function getFreshToken(credsPath) {
+  const oauth = getToken(credsPath);
+  if (credsPath === 'env') return oauth;
+  const msLeft = oauth.expiresAt - Date.now();
+  if (msLeft > TOKEN_REFRESH_SKEW_MS) return oauth;
+  try {
+    return await refreshOauthToken(credsPath);
+  } catch (e) {
+    console.error('[AUTH] Proactive refresh failed (using stale token, will retry on 401): ' + e.message);
+    return oauth;
+  }
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
@@ -669,10 +798,12 @@ function startServer(config, profileName) {
     const chunks = [];
 
     req.on('data', c => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       let body = Buffer.concat(chunks);
       let oauth;
-      try { oauth = getToken(config.credsPath); } catch (e) {
+      try {
+        oauth = await getFreshToken(config.credsPath);
+      } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
         return;
@@ -683,26 +814,27 @@ function startServer(config, profileName) {
       bodyStr = processBody(bodyStr, config);
       body = Buffer.from(bodyStr, 'utf8');
 
-      const headers = {};
+      // Build the outgoing header template ONCE, then inject a fresh Bearer
+      // per attempt. This lets us retry with a refreshed token on 401.
+      const headerTemplate = {};
       for (const [key, value] of Object.entries(req.headers)) {
         const lk = key.toLowerCase();
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
             lk === 'x-api-key' || lk === 'content-length' ||
             lk === 'x-session-affinity') continue;
-        headers[key] = value;
+        headerTemplate[key] = value;
       }
-      headers['authorization'] = `Bearer ${oauth.accessToken}`;
-      headers['content-length'] = body.length;
-      headers['accept-encoding'] = 'identity';
-      headers['anthropic-version'] = '2023-06-01';
+      headerTemplate['content-length'] = body.length;
+      headerTemplate['accept-encoding'] = 'identity';
+      headerTemplate['anthropic-version'] = '2023-06-01';
 
       // Inject Stainless SDK + Claude Code identity headers
       const ccHeaders = getStainlessHeaders();
       for (const [k, v] of Object.entries(ccHeaders)) {
-        headers[k] = v;
+        headerTemplate[k] = v;
       }
 
-      const existingBeta = headers['anthropic-beta'] || '';
+      const existingBeta = headerTemplate['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
       for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
       const model = extractModel(bodyStr);
@@ -710,85 +842,106 @@ function startServer(config, profileName) {
         if (test(model)) { if (!betas.includes(beta)) betas.push(beta); }
         else { const i = betas.indexOf(beta); if (i !== -1) betas.splice(i, 1); }
       }
-      headers['anthropic-beta'] = betas.join(',');
+      headerTemplate['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] [${label}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
-      const upstream = https.request({
-        hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
-      }, (upRes) => {
-        const status = upRes.statusCode;
-        console.log(`[${ts}] [${label}] #${reqNum} > ${status}`);
-        if (status !== 200 && status !== 201) {
-          const errChunks = [];
-          upRes.on('data', c => errChunks.push(c));
-          upRes.on('end', () => {
-            let errBody = Buffer.concat(errChunks).toString();
-            if (errBody.includes('extra usage')) {
-              console.error(`[${ts}] [${label}] #${reqNum} DETECTION! Body: ${body.length}b`);
-              try { fs.writeFileSync('/tmp/proxy_detected_' + label + '_' + reqNum + '.json', body); } catch(e) {} // eslint-disable-line
-            }
-            errBody = reverseMap(errBody, config);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding'];
-            nh['content-length'] = Buffer.byteLength(errBody);
-            res.writeHead(status, nh);
-            res.end(errBody);
-          });
-          return;
-        }
-        // SSE streaming with tail-buffer for chunk boundary safety (upstream issue #11)
-        if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          const sseHeaders = { ...upRes.headers };
-          delete sseHeaders['content-length'];
-          delete sseHeaders['transfer-encoding'];
-          res.writeHead(status, sseHeaders);
-          const TAIL_SIZE = 64;
-          const decoder = new StringDecoder('utf8');
-          let pending = '';
-          upRes.on('data', (chunk) => {
-            pending += decoder.write(chunk);
-            if (pending.length > TAIL_SIZE) {
-              let sliceIdx = pending.length - TAIL_SIZE;
-              const prev = pending.charCodeAt(sliceIdx - 1);
-              if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
-              const flushable = pending.slice(0, sliceIdx);
-              pending = pending.slice(sliceIdx);
-              res.write(reverseMap(flushable, config));
-            }
-          });
-          upRes.on('end', () => {
-            pending += decoder.end();
-            if (pending.length > 0) {
-              res.write(reverseMap(pending, config));
-            }
-            res.end();
-          });
-        } else {
-          const respChunks = [];
-          upRes.on('data', c => respChunks.push(c));
-          upRes.on('end', () => {
-            let respBody = Buffer.concat(respChunks).toString();
-            respBody = reverseMap(respBody, config);
-            const nh = { ...upRes.headers };
-            delete nh['transfer-encoding'];
-            nh['content-length'] = Buffer.byteLength(respBody);
-            res.writeHead(status, nh);
-            res.end(respBody);
-          });
-        }
-      });
-      upstream.on('error', e => {
-        console.error(`[${ts}] [${label}] #${reqNum} ERR: ${e.message}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
-        }
-      });
-      upstream.write(body);
-      upstream.end();
+      // attempt=1 is the initial request; attempt=2 is the post-refresh retry.
+      const sendUpstream = (tokenOauth, attempt) => {
+        const headers = { ...headerTemplate, authorization: `Bearer ${tokenOauth.accessToken}` };
+        const upstream = https.request({
+          hostname: UPSTREAM_HOST, port: 443,
+          path: req.url, method: req.method, headers
+        }, (upRes) => {
+          const status = upRes.statusCode;
+          console.log(`[${ts}] [${label}] #${reqNum} > ${status}${attempt > 1 ? ' (retry)' : ''}`);
+          if (status !== 200 && status !== 201) {
+            const errChunks = [];
+            upRes.on('data', c => errChunks.push(c));
+            upRes.on('end', async () => {
+              let errBody = Buffer.concat(errChunks).toString();
+              // On 401 authentication_error, refresh the token once and retry.
+              // This catches the case where the token expired mid-flight (the
+              // eager refresh window didn't trigger, or Anthropic rotated it).
+              if (status === 401 && attempt === 1 && config.credsPath !== 'env' &&
+                  /authentication_error|invalid.*api.?key|unauthorized/i.test(errBody)) {
+                console.error(`[${ts}] [${label}] #${reqNum} got 401 — refreshing token and retrying…`);
+                try {
+                  const refreshed = await refreshOauthToken(config.credsPath);
+                  sendUpstream(refreshed, 2);
+                  return;
+                } catch (e) {
+                  console.error(`[${ts}] [${label}] #${reqNum} refresh failed: ${e.message}`);
+                  // fall through to forwarding the original 401
+                }
+              }
+              if (errBody.includes('extra usage')) {
+                console.error(`[${ts}] [${label}] #${reqNum} DETECTION! Body: ${body.length}b`);
+                try { fs.writeFileSync('/tmp/proxy_detected_' + label + '_' + reqNum + '.json', body); } catch(e) {} // eslint-disable-line
+              }
+              errBody = reverseMap(errBody, config);
+              const nh = { ...upRes.headers };
+              delete nh['transfer-encoding'];
+              nh['content-length'] = Buffer.byteLength(errBody);
+              res.writeHead(status, nh);
+              res.end(errBody);
+            });
+            return;
+          }
+          // SSE streaming with tail-buffer for chunk boundary safety (upstream issue #11)
+          if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
+            const sseHeaders = { ...upRes.headers };
+            delete sseHeaders['content-length'];
+            delete sseHeaders['transfer-encoding'];
+            res.writeHead(status, sseHeaders);
+            const TAIL_SIZE = 64;
+            const decoder = new StringDecoder('utf8');
+            let pending = '';
+            upRes.on('data', (chunk) => {
+              pending += decoder.write(chunk);
+              if (pending.length > TAIL_SIZE) {
+                let sliceIdx = pending.length - TAIL_SIZE;
+                const prev = pending.charCodeAt(sliceIdx - 1);
+                if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
+                const flushable = pending.slice(0, sliceIdx);
+                pending = pending.slice(sliceIdx);
+                res.write(reverseMap(flushable, config));
+              }
+            });
+            upRes.on('end', () => {
+              pending += decoder.end();
+              if (pending.length > 0) {
+                res.write(reverseMap(pending, config));
+              }
+              res.end();
+            });
+          } else {
+            const respChunks = [];
+            upRes.on('data', c => respChunks.push(c));
+            upRes.on('end', () => {
+              let respBody = Buffer.concat(respChunks).toString();
+              respBody = reverseMap(respBody, config);
+              const nh = { ...upRes.headers };
+              delete nh['transfer-encoding'];
+              nh['content-length'] = Buffer.byteLength(respBody);
+              res.writeHead(status, nh);
+              res.end(respBody);
+            });
+          }
+        });
+        upstream.on('error', e => {
+          console.error(`[${ts}] [${label}] #${reqNum} ERR: ${e.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+          }
+        });
+        upstream.write(body);
+        upstream.end();
+      };
+
+      sendUpstream(oauth, 1);
     });
   });
 
